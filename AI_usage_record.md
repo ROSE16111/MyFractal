@@ -474,3 +474,237 @@ no grad：用 torch.no_grad() 禁止构图，省内存和开销，适合推理�
 root basins：输出 root_idx（属谁的吸引域）+ iters（收敛速度），按根上色、按速度调亮度；未收敛涂黑。
 
 如果你愿意，我可以把你的 NewtonFractal.py 再加上计时打印（GPU/CPU 对比）、z.device 检查，帮你在演示时更有说服力。
+
+* Q3
+P:
+估计分形维数（fractal dimension）或做不同可视化/配色是不是可以二选一，我觉得做不同可视化会不会更简单，该参数就行？
+A:
+结论先说：
+是的，“估计分形维数（fractal dimension） 或 做不同可视化/配色（different visualisations and colours）”是二选一的可接受方式，用来满足“substantial analysis（实质性分析）”的要求。讲义原文就是“for example … fractal dimension … Or incorporate different visualisations and colours …”（强调了 Or）。
+
+不过——如果你选择“可视化路线”，必须做得有实质性，不能只是换一个 cmap 或改一个颜色参数就了事；教学团队有权对“投入不够”的项目降分。
+
+下面给你一份最稳妥的可视化方案（Newton Fractal 专用），既简单又能体现“分析深度”，并告诉你要改哪几行代码、交付什么。
+
+选“可视化路线”怎么做才算“实质性”（Substantial）
+
+建议至少做 3 种互补的可视化，并在 README 里解释它们各自揭示了分形的哪个性质（basins / speed / boundary 等）：
+
+Root basins map（根域图）：不同根用不同基色，体现“吸引域（basin of attraction）”的分割结构。
+
+Convergence speed map（收敛速度图）：用迭代步数 iters 做亮度/颜色，展示哪个区域收敛快/慢（数值稳定性/边界刚性）。
+
+Residual/phase map（残差或相位）：固定迭代步后画 log10|f(z)|（或 arg(f(z))），显示“收敛质量/局部动力学”；或叠加 boundary mask 高亮边界。
+
+只换 cmap ≠ 实质性；而是要换数据度量（data metric）并解释含义。这就满足“substantial analysis”的精神与字面要求。
+
+代码怎么改（在你已有 NewtonFractal.py 基础上）
+1）让核心函数多返回两个量
+
+已有：root_idx, iters
+
+新增：z_final（最后迭代的 z），f_final = z_final**3 - 1（用于残差/相位）
+
+在迭代结束后加上：
+
+# 迭代循环结束后（或返回前）
+z_final = z.detach().cpu().numpy()
+f_final = (z.real*z.real*z.real - 1.0).detach().cpu().numpy()  # 或 torch.pow(z,3)-1
+return (root_idx.detach().cpu().numpy(),
+        iters.detach().cpu().numpy(),
+        z_final, f_final)
+
+2）三种可视化（新增函数或直接写在 main）
+import numpy as np
+import matplotlib.pyplot as plt
+
+def viz_root_basins(root_idx, iters, gamma=0.75):
+    # 基于根编号的基色 + 速度调亮度（已在你代码里有类似实现）
+    colors = np.array([[0.9,0.2,0.2],
+                       [0.2,0.9,0.2],
+                       [0.2,0.2,0.9]], dtype=np.float32)
+    H, W = root_idx.shape
+    img = np.zeros((H,W,3), dtype=np.float32)
+    for i in range(3):
+        m = (root_idx == i)
+        shade = (iters[m] + 1e-3)**(-gamma)
+        img[m] = colors[i] * shade[:, None]
+    img[root_idx < 0] = 0.0
+    return np.uint8(np.clip(img*255, 0, 255))
+
+def viz_speed_heatmap(iters):
+    # 只看“迭代步数”，反映收敛速度（数值特性）
+    arr = iters.astype(np.float32)
+    arr[arr==0] = np.nan  # 未收敛或异常可设为 NaN 在 cmap 里透明
+    # 归一化 & 伽马压缩，增强对比度
+    m, M = np.nanmin(arr), np.nanmax(arr)
+    norm = (arr - m) / (M - m + 1e-9)
+    heat = np.uint8(np.clip(255 * (1.0 - norm**0.6), 0, 255))  # 快=亮
+    return heat  # 可用 plt.imshow(heat, cmap="magma")
+
+def viz_residual_log(f_final):
+    # 画 log10|f(z)|：收敛质量/边界锐度（固定步数或最终步）
+    mag = np.abs(f_final).astype(np.float32)
+    logm = np.log10(mag + 1e-12)
+    # 线性拉伸到 [0,255]
+    m, M = np.nanmin(logm), np.nanmax(logm)
+    norm = (logm - m) / (M - m + 1e-9)
+    return np.uint8(np.clip(255 * (1.0 - norm), 0, 255))  # 小残差=亮
+
+3）主程序演示（并排三图，确保“看得出差异”）
+root_idx, iters, z_final, f_final = newton_fractal(
+    x_range=(-2,2), y_range=(-2,2), step=0.0025, max_iter=50, tol=1e-6
+)
+
+img_basins = viz_root_basins(root_idx, iters)
+img_speed  = viz_speed_heatmap(iters)
+img_resid  = viz_residual_log(f_final)
+
+plt.figure(figsize=(15,5))
+plt.subplot(1,3,1); plt.title("Basins + speed"); plt.imshow(img_basins); plt.axis("off")
+plt.subplot(1,3,2); plt.title("Convergence steps"); plt.imshow(img_speed, cmap="magma"); plt.axis("off")
+plt.subplot(1,3,3); plt.title("log10|f(z)|"); plt.imshow(img_resid, cmap="viridis"); plt.axis("off")
+plt.tight_layout(); plt.show()
+
+# 保存（用于 README）
+# from pathlib import Path; Path("outputs").mkdir(exist_ok=True)
+# plt.imsave("outputs/newton_basins.png", img_basins)
+# plt.imsave("outputs/newton_steps.png", img_speed, cmap="magma")
+# plt.imsave("outputs/newton_residual.png", img_resid, cmap="viridis")
+
+
+这样你就不是“换个 cmap”，而是三个不同的度量维度：basin 划分、速度场、残差/相位。这在口头解释时也更“像分析”。同时把图放进 README，并写明你观察到的现象（例如：边界附近 iters 高、|f| 大幅起伏；远离边界收敛更快等）。
+
+README 怎么写（示例要点）
+
+What we visualise：
+
+Basins map：显示吸引域分割，不同根不同颜色；亮度按收敛步数。
+
+Convergence steps：仅用迭代步数，直观展示哪里“难收敛”。
+
+log10|f(z)|：残差/局部动力学；边界处值更大（或更不均匀）。
+
+Why it matters：这些可视化“解释”了 Newton 动力系统的特征，而不是只换色板。
+
+How to reproduce：命令 & 参数（step/max_iter/tol）。
+
+AI usage record：链接到 docs/AI_usage_record.md（满足记录要求）。
+
+Parallelism：强调主要计算在 PyTorch 的 CUDA tensor 上完成，使用 vectorised ops + mask + no_grad（演示评分点）。
+
+Demo 提醒（和评分点对齐）
+
+演示时：
+
+打开代码与输出；说明 PyTorch/TF 在主要组件里做了并行计算（vectorised + mask）。
+
+打开你的 GitHub 仓库页面。
+
+即使选了“可视化路线”，也务必保留/展示你的 prompts 记录；只用一个 prompt 会被扣分。
+
+小结
+
+“维数 或 可视化”是二选一；做可视化完全可行。
+
+但要做成实质性分析：至少 3 个互补的可视化维度 + 简短文字解释 + README 图。
+
+上面的代码改动很少、产出直观，能稳稳对上“Important Notes”和“Demonstration”的要求
+
+Q4:
+P:
+为什么步数越少，越亮
+A:
+因为我们在可视化里用的是这样一条亮度映射：
+
+shade
+  
+=
+  
+(
+iters
++
+𝜀
+)
+−
+𝛾
+(
+𝛾
+>
+0
+)
+shade=(iters+ε)
+−γ
+(γ>0)
+
+iters：该像素收敛所用的迭代步数（步数越少 = 收敛越快）。
+
+shade：用于乘到颜色上的亮度（值越大越亮）。
+
+−
+𝛾
+−γ 次幂是一个单调递减函数：步数越大，shade 越小 → 越暗；步数越小，shade 越大 → 越亮。
+
+直觉：我们想“快收敛 = 亮、慢收敛 = 暗”，这样吸引域（basin）内部通常一片明亮、边界因为需要更多步数而更暗，边界花纹会很清楚。
+
+数值直观（举例，取 
+𝛾
+=
+0.75
+γ=0.75）
+iters	shade = iters^-0.75	亮度感受
+1	1.00	非常亮
+2	≈ 0.59	亮
+4	≈ 0.35	中等
+8	≈ 0.21	偏暗
+16	≈ 0.12	更暗
+
+可以看到，步数翻倍亮度大约乘以 
+2
+−
+0.75
+≈
+0.59
+2
+−0.75
+≈0.59，所以越慢收敛越暗。
+
+为什么不直接线性映射？
+
+迭代步数分布往往极不均匀（很多点很快收敛，少数点特别慢）。用幂函数（或对数/指数）能压缩动态范围，让边界与内部都看得清。
+
+𝛾
+γ 是对比度控制：
+
+𝛾
+γ 大一些 → 暗得更快，边界更“黑”，对比强；
+
+𝛾
+γ 小一些 → 曲线更平缓，亮暗差减小。
+
+你可以把这行改着玩：
+
+shade = (iters.astype(np.float32) + 1e-3)**(-gamma)  # gamma 可调
+
+也可以反过来画（按需求）
+
+如果你更喜欢“慢收敛 = 亮、快收敛 = 暗”，只要把映射反过来即可，例如：
+
+# 线性归一化后取 1 - norm：步数越多越亮
+m, M = iters.min(), iters.max()
+norm  = (iters - m) / (M - m + 1e-9)
+shade = norm**gamma        # 或 1 - (1 - norm)**gamma 等变体
+
+
+或者用指数衰减：
+
+shade = np.exp(-alpha * iters)  # alpha 控制衰减速度
+
+总结
+
+我们有意把“步数越少 → 越亮”来表达“收敛更快”；
+
+这样basin 内部通常亮且均匀，basin 边界（收敛慢/混沌）呈现暗色花纹；
+
+𝛾
+γ 是你的“对比度旋钮”，按视觉需要调整即可。
