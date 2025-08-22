@@ -322,3 +322,155 @@ AI 使用：一定记录多轮 prompts 与你主动修改的证据。
 分析：至少做一个“维数估计”或“多种可视化/配色”的加项（最好都做）。
 
 需要的话我可以把 NewtonFractal.py 再加上可视化对比（root basins vs. iteration heatmap）和保存 root_idx/iters 的 .npy 行，或者直接给你一版 README.md 模板文本，你贴进去就能交
+
+* Q2
+P:
+vectorised on GPU（整张网格张量并行更新）、mask（只迭代未收敛像素、可提前停止）、no grad（推理模式）、root basins（按根着色 + 速度明暗）。详细分析一下这四个点对应了哪些代码，然后告诉我哪里体现出主要组件使用 PyTorch/TF 并行，主要组件使用 PyTorch/TF 并行是什么意思
+A:
+好嘞！我把你关心的 4 个关键词逐一“对号入座”，标出对应的代码、解释“在做什么/为什么这么做”，最后讲清楚什么叫主要组件使用 PyTorch/TF 并行以及你在代码里如何证明这一点。
+
+1) vectorised on GPU（整张网格张量并行更新）
+代码位置（示例来自我给你的 NewtonFractal.py）
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+...
+x = torch.from_numpy(x_np).to(device=device)
+y = torch.from_numpy(y_np).to(device=device)
+grid = torch.complex(x, y).to(dtype=complex_dtype)      # (H,W) 复数网格，全在 GPU
+
+# 迭代核心（每一轮都“整张图”并行更新）
+z_alive = z[mask]
+c_alive = c[mask]
+# (1) f(z)=z^3-1, f'(z)=3z^2   —— 全在 GPU 做张量运算
+f  = z_alive*z_alive*z_alive - 1.0
+fp = 3.0 * z_alive*z_alive
+# (2) 牛顿步 z ← z - f/f'
+z_alive = z_alive - f / (fp + 1e-12)
+z[mask] = z_alive
+
+# (3) 与三个根做“广播”距离比较（一次性向量化）
+diffs = z_alive.unsqueeze(-1) - ROOTS        # shape: (N_alive, 3)
+d2 = (diffs.real**2 + diffs.imag**2)
+min_d2, min_idx = torch.min(d2, dim=1)       # reduction 在 GPU 上做
+
+这在干嘛
+
+vectorised：没有用 Python 的双重 for 逐像素算，而是把整张 (H×W) 网格作为一个/几个大张量交给 PyTorch 的 CUDA kernels 去算。
+
+每个表达式（比如 z_alive*z_alive、torch.min）都会在 GPU 上启动成千上万的线程，一次把所有像素都更新。
+
+广播（broadcasting）：z_alive.unsqueeze(-1) - ROOTS 自动把 (N_alive,1) 和 (3,) 扩成 (N_alive,3)，避免显式循环。
+
+2) mask（只迭代未收敛像素、可提前停止）
+代码位置
+mask     = torch.ones((H, W), dtype=torch.bool, device=device)  # 仍未收敛(Alive)
+...
+# 只对 Alive 的像素做牛顿步
+z_alive = z[mask]
+c_alive = c[mask]
+z_alive = z_alive*z_alive*z_alive - 1.0  # 等等（略）
+...
+# 收敛判据：离某个根足够近
+conv = (min_d2 < (tol*tol))
+
+# 把刚收敛的像素从 mask 里剔除（以后不再更新）
+alive_indices = torch.where(mask)
+new_mask = mask.clone()
+new_mask[alive_indices[0][conv], alive_indices[1][conv]] = False
+mask = new_mask
+
+if not mask.any():    # 没有活着的像素了 → 提前结束
+    break
+
+这在干嘛
+
+目的：减少无谓计算、加速。已经收敛的像素之后每一轮都不会再算（否则白白做乘法/除法）。
+
+只更新 Alive：z[mask] = ... 表示更新的是布尔索引选出来的子集（仍未收敛的像素集合）。
+
+提前结束：当 mask.any()==False，说明所有像素都已收敛，循环立即 break。
+
+实际效果：更少的元素参与后续 CUDA 计算，深迭代/大图时能显著提速。
+
+3) no grad（推理模式 / 关闭自动求导）
+代码位置
+with torch.no_grad():
+    for k in range(max_iter):
+        ...
+
+这在干嘛
+
+分形渲染不是训练，不需要反向传播的 梯度图（computation graph）。
+
+torch.no_grad() 会在这段代码内关闭 autograd：
+
+减少内存（不保存中间变量）
+
+减少调度/元操作开销
+
+小幅提升吞吐（尤其在高迭代时更明显）
+
+4) root basins（按根着色 + 速度明暗）
+代码位置
+# 计算阶段得到：
+root_idx  # (H,W,int8)  每个像素收敛到哪个根（0/1/2，或 -1 = 未收敛）
+iters     # (H,W,int16) 收敛用的步数（速度）
+
+def color_root_basins(root_idx, iters, gamma=0.75):
+    colors = np.array([[0.9,0.2,0.2],
+                       [0.2,0.9,0.2],
+                       [0.2,0.2,0.9]])
+    for i in range(3):
+        mask = (root_idx == i)
+        shade = (iters[mask] + 1e-3)**(-gamma)  # 步数越少越亮（收敛越快越亮）
+        img[mask] = colors[i] * shade[:, None]
+    img[root_idx < 0] = 0.0                     # 未收敛涂黑
+
+这在干嘛
+
+basins of attraction：不同初值点最终会收敛到不同的根（吸引域）。
+
+用 root_idx 决定基色（红/绿/蓝），用 iters 决定亮度（收敛更快 → 更亮）。
+
+未收敛（-1）像素设为黑色，清晰区分。
+
+注意：这一步可在 CPU/NumPy 上做（因为只是可视化），主要计算已在 GPU 完成。
+
+“主要组件使用 PyTorch/TF 并行”是什么意思？
+
+定义（课堂语境）：你的分形算法的**核心计算部分（major component）**必须以 tensor operations 的方式交给 PyTorch/TF 后端在 GPU（或优化的 CPU）上并行执行，而不是用 Python 自己的 for 循环逐像素计算。
+
+在你的实现里，哪些是“主要组件并行”？
+
+主要组件 = Newton 迭代更新 + 收敛判定：
+
+f=z^3-1、fp=3z^2、z ← z - f/f'、与三根的距离比较 torch.min，都是对整块张量的向量化操作。
+
+这些操作在 device=cuda 的张量上运行 → 由 CUDA kernels 启动大量线程同时处理成千上万像素。
+
+mask 策略：用布尔张量来筛选“仍未收敛”的元素，保证后续计算只在必要的元素上进行。这同样是张量级并行，而非 Python 层面迭代。
+
+反例（不合格的做法）
+
+用双重 for y in range(H): for x in range(W): 然后对每个像素单独做 complex 迭代（哪怕张量在 GPU 上，也会因 Python 循环串行调用而极慢），这就不是“主要组件使用 PyTorch/TF 并行”。
+
+如何现场证明你确实在用并行？
+
+打印/展示关键张量的 device：print(z.device, f.device, root_idx.device) → 全是 cuda:0。
+
+对比关掉 GPU（强制 device='cpu'）的耗时差异；或用更大的图/更大的 max_iter 显示 GPU 明显更快。
+
+讲清楚：
+
+“我没有逐像素 for 循环；而是把整张图表示为张量，所有更新都是 element-wise + broadcasting + reduction，这些都会触发 GPU kernel 并行执行。”
+
+小抄：一句话讲清四点（Demo 用）
+
+vectorised on GPU：网格与状态 z 都是 GPU 张量；z*z / f(z) / min 等操作一次在整张图上做，底层是 CUDA 并行 kernel。
+
+mask：用布尔张量筛选未收敛像素，只更新这些点并在全部收敛时提前退出，减少无谓计算。
+
+no grad：用 torch.no_grad() 禁止构图，省内存和开销，适合推理渲染。
+
+root basins：输出 root_idx（属谁的吸引域）+ iters（收敛速度），按根上色、按速度调亮度；未收敛涂黑。
+
+如果你愿意，我可以把你的 NewtonFractal.py 再加上计时打印（GPU/CPU 对比）、z.device 检查，帮你在演示时更有说服力。
